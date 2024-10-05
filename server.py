@@ -1,159 +1,200 @@
 import threading
 import socket
-import tkinter as tk
-from tkinter import scrolledtext
-import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+from colorama import Fore, Style, init
 
-# Constants
+# Initialize colorama
+init(autoreset=True)
+
 PORT = 5050
 SERVER = "localhost"
 ADDR = (SERVER, PORT)
 FORMAT = "utf-8"
 DISCONNECT_MESSAGE = "!DISCONNECT"
 
-class ChatServer:
-    def __init__(self, root):
-        self.root = root
-        self.setup_gui()
-        
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.clients = set()
-        self.clients_lock = threading.Lock()
-        self.server_running = False
+# Enter your SMTP email configuration
+smtp_server = "smtp.gmail.com"
+smtp_port = 587
+smtp_email = "your_email@gmail.com"
+smtp_password = "your_password"
 
-        self.bind_server()
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(ADDR)
 
-    def setup_gui(self):
-        """Sets up the GUI components."""
-        self.root.title("Chat Server")
+clients = {}
+clients_info = {}  # Stores client info like name and email
+clients_lock = threading.Lock()
 
-        self.log_area = scrolledtext.ScrolledText(self.root, wrap=tk.WORD, state='disabled', width=50, height=20)
-        self.log_area.pack(padx=10, pady=10)
+def send_email_notification(sender_name, sender_email, recipient_name, recipient_email, message):
+    """
+    Sends an email notification to the recipient when they receive a message.
+    """
+    subject = f"New Message from {sender_name}"
+    body = f"""
+    Hello {recipient_name},
 
-        self.message_entry = tk.Entry(self.root, width=50)
-        self.message_entry.pack(padx=10, pady=5)
+    You have received a new message from {sender_name} ({sender_email}):
 
-        self.send_button = tk.Button(self.root, text="Broadcast", command=self.server_broadcast)
-        self.send_button.pack(padx=10, pady=5)
+    "{message}"
 
-        self.start_button = tk.Button(self.root, text="Start Server", command=self.start_server)
-        self.start_button.pack(padx=10, pady=5)
+    Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-        self.stop_button = tk.Button(self.root, text="Stop Server", command=self.stop_server, state='disabled')
-        self.stop_button.pack(padx=10, pady=10)
+    Regards,
+    Chat Server
+    """
 
-    def bind_server(self):
-        """Binds the server to the address."""
-        try:
-            self.server.bind(ADDR)
-        except Exception as e:
-            self.log_message(f"[ERROR] Could not bind server: {e}")
+    msg = MIMEMultipart()
+    msg['From'] = smtp_email
+    msg['To'] = recipient_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
 
-    def log_message(self, message):
-        """Logs a message in the GUI."""
-        self.log_area.config(state='normal')
-        self.log_area.insert(tk.END, message + '\n')
-        self.log_area.config(state='disabled')
-        self.log_area.yview(tk.END)
+    try:
+        # Send email using SMTP
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_email, smtp_password)
+        server.sendmail(smtp_email, recipient_email, msg.as_string())
+        server.quit()
+        print(Fore.GREEN + f"[EMAIL] Notification sent to {recipient_email}.")
+    except Exception as e:
+        print(Fore.RED + f"[ERROR] Failed to send email: {e}")
 
-    def handle_client(self, conn, addr):
-        """Handles communication with a client."""
-        self.log_message(f"[NEW CONNECTION] {addr} connected.")
+def broadcast(message, sender_conn=None):
+    """
+    Send a message to all connected clients except the sender (if applicable).
+    """
+    with clients_lock:
+        for client_conn, client_id in clients.items():
+            if client_conn != sender_conn:  # Don't send to the sender
+                try:
+                    client_conn.sendall(message)
+                except Exception as e:
+                    print(Fore.RED + f"[ERROR] Failed to send message to {client_id}: {e}")
+                    clients.pop(client_conn)
+
+def handle_client(conn, addr):
+    """
+    Handles each connected client.
+    """
+    conn.send("Enter your name: ".encode(FORMAT))
+    name = conn.recv(1024).decode(FORMAT).strip()
+
+    conn.send("Enter your email: ".encode(FORMAT))
+    email = conn.recv(1024).decode(FORMAT).strip()
+
+    with clients_lock:
+        clients[conn] = f"{addr}"
+        clients_info[conn] = {"name": name, "email": email}
+
+    print(Fore.YELLOW + f"[NEW CONNECTION] {name} ({addr}) connected with email {email}")
+
+    try:
         connected = True
-
         while connected:
             try:
                 msg = conn.recv(1024).decode(FORMAT)
+                if not msg:
+                    break
+
                 if msg == DISCONNECT_MESSAGE:
                     connected = False
-                elif msg:
-                    broadcast_message = self.format_message(addr, msg)
-                    self.log_message(broadcast_message)
-                    self.broadcast(broadcast_message, conn)
-            except (ConnectionResetError, Exception) as e:
-                self.log_message(f"[ERROR] Connection issue with {addr}: {e}")
+
+                # Log the message received by the server
+                print(Fore.BLUE + f"[{addr}] Received: {msg}")
+
+                # Ensure the message starts with '@'
+                if msg.startswith("@"):
+                    if ":" in msg:
+                        target_client, message = msg[1:].split(":", 1)  # Only split once
+
+                        # Handle @all case
+                        if target_client.strip().lower() == "all":
+                            # Log the broadcast message
+                            print(Fore.CYAN + f"[{addr}] Broadcasting to all clients: {message}")
+
+                            # Broadcast message to all clients
+                            broadcast(f"[{clients_info[conn]['name']}] {message}".encode(FORMAT), sender_conn=conn)
+                        else:
+                            # Send to specific client
+                            found = False
+                            with clients_lock:
+                                for client_conn, client_id in clients.items():
+                                    if target_client.strip() in client_id:  # Matching target client
+                                        recipient_name = clients_info[client_conn]['name']
+                                        recipient_email = clients_info[client_conn]['email']
+                                        sender_name = clients_info[conn]['name']
+                                        sender_email = clients_info[conn]['email']
+
+                                        print(Fore.GREEN + f"[{addr}] Sending to {recipient_name} ({recipient_email}): {message}")
+                                        client_conn.sendall(
+                                            f"[{sender_name} -> {recipient_name}] {message}".encode(FORMAT))
+
+                                        # Send email notification
+                                        send_email_notification(sender_name, sender_email, recipient_name,
+                                                                recipient_email, message)
+                                        conn.sendall(f"[SERVER] Email sent to {recipient_name}.".encode(FORMAT))
+                                        found = True
+                                        break
+                            if not found:
+                                conn.sendall(Fore.RED + f"[SERVER] Client {target_client} not found.".encode(FORMAT))
+                    else:
+                        # Invalid format (missing ':')
+                        conn.sendall(
+                            f"[SERVER] Invalid format. Use '@client_id: message' or '@all: message'.".encode(FORMAT))
+                else:
+                    # Handle messages that don't follow the '@client_id: message' or '@all: message' format
+                    conn.sendall(
+                        f"[SERVER] Invalid message format. Use '@client_id: message' or '@all: message'.".encode(FORMAT))
+
+            except ConnectionResetError:
+                print(Fore.RED + f"[ERROR] Connection with {addr} was reset.")
                 break
-        
-        self.remove_client(conn)
+
+    except Exception as e:
+        print(Fore.RED + f"[ERROR] Exception in handling client {addr}: {e}")
+    finally:
+        with clients_lock:
+            clients.pop(conn, None)
+            clients_info.pop(conn, None)
         conn.close()
-        self.log_message(f"[DISCONNECT] {addr} disconnected")
+        print(Fore.RED + f"[DISCONNECT] {addr} Disconnected")
 
-    def format_message(self, addr, msg):
-        """Formats the message with a timestamp and address."""
-        time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return f"{time} [{addr}] {msg}"
+def server_console():
+    """
+    Allows server to send messages to all clients.
+    Type your message in the server terminal to broadcast it to all clients.
+    """
+    while True:
+        msg = input()
+        if msg == 'q':
+            break
+        broadcast(f"[SERVER] {msg}".encode(FORMAT))
 
-    def server_broadcast(self):
-        """Broadcasts a server message to all clients."""
-        message = self.message_entry.get()
-        if message:
-            broadcast_message = f"{self.format_message('SERVER', message)}"
-            self.message_entry.delete(0, tk.END)
-            self.log_message(f"[BROADCAST] {broadcast_message}")
-            self.broadcast(broadcast_message)
+def start():
+    print(Fore.GREEN + '[SERVER STARTED]! Listening for connections...')
+    server.listen()
 
-    def broadcast(self, message, sender_conn=None):
-        """Sends a message to all clients except the sender."""
-        with self.clients_lock:
-            for client in self.clients:
-                if client != sender_conn:
-                    try:
-                        client.sendall(message.encode(FORMAT))
-                    except Exception as e:
-                        self.log_message(f"[ERROR] Error broadcasting to client: {e}")
+    # Start server console for broadcasting messages
+    console_thread = threading.Thread(target=server_console, daemon=True)
+    console_thread.start()
 
-    def remove_client(self, conn):
-        """Removes a client from the set of clients."""
-        with self.clients_lock:
-            if conn in self.clients:
-                self.clients.remove(conn)
-
-    def start_server(self):
-        """Starts the server and accepts clients."""
-        self.start_button.config(state='disabled')
-        self.stop_button.config(state='normal')
-        self.server_running = True
-        self.log_message('[SERVER STARTED]')
-        
-        self.server.listen()
-        threading.Thread(target=self.accept_clients, daemon=True).start()
-
-    def accept_clients(self):
-        """Accepts incoming client connections."""
-        while self.server_running:
-            try:
-                conn, addr = self.server.accept()
-                with self.clients_lock:
-                    self.clients.add(conn)
-                threading.Thread(target=self.handle_client, args=(conn, addr), daemon=True).start()
-            except Exception as e:
-                self.log_message(f"[ERROR] Error accepting client: {e}")
-                break
-
-    def stop_server(self):
-        """Stops the server and disconnects all clients."""
-        self.server_running = False
-        self.log_message('[SERVER STOPPING]')
-
-        with self.clients_lock:
-            for client in self.clients:
-                try:
-                    client.sendall(DISCONNECT_MESSAGE.encode(FORMAT))
-                    client.close()
-                except Exception as e:
-                    self.log_message(f"[ERROR] Error disconnecting client: {e}")
-            self.clients.clear()
-
-        self.server.close()
-        self.stop_button.config(state='disabled')
-        self.start_button.config(state='normal')
-        self.log_message('[SERVER STOPPED]')
-
-def start_server_gui():
-    """Launches the GUI."""
-    root = tk.Tk()
-    ChatServer(root)
-    root.mainloop()
+    while True:
+        try:
+            conn, addr = server.accept()
+            thread = threading.Thread(target=handle_client, args=(conn, addr))
+            thread.start()
+        except Exception as e:
+            print(Fore.RED + f"[ERROR] Exception in accepting connections: {e}")
 
 if __name__ == "__main__":
-    start_server_gui()
+    try:
+        start()
+    except Exception as e:
+        print(Fore.RED + f"[ERROR] Server encountered an error: {e}")
+    finally:
+        server.close()
+        
